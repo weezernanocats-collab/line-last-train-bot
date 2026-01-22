@@ -6,6 +6,7 @@ LINEで駅名を送ると、その駅から西千葉駅への終電を調べて�
 
 import os
 import re
+import json
 import requests
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
@@ -140,12 +141,14 @@ def search_last_train(from_station, to_station):
         now = datetime.now(jst)
 
         # Yahoo!路線情報のURL
-        # type=4 は終電検索
+        # type=1: 出発時刻指定、深夜23:50で検索して終電を取得
         url = (
             f"https://transit.yahoo.co.jp/search/result"
             f"?from={quote(from_station)}"
             f"&to={quote(to_station)}"
-            f"&type=4"  # 終電
+            f"&y={now.year}&m={now.month:02d}&d={now.day:02d}"
+            f"&hh=23&mm=50"
+            f"&type=1"  # 出発時刻指定
             f"&ticket=ic"  # IC優先
         )
 
@@ -170,16 +173,13 @@ def search_last_train(from_station, to_station):
             candidates = [a.get_text(strip=True) for a in candidate_list[:5]]
             return f"「{from_station}」に該当する駅が複数あります:\n" + "\n".join(f"・{c}" for c in candidates)
 
-        # 検索結果を取得
-        route_elem = soup.select_one("div.routeList, ul.routeList")
-        if not route_elem:
-            # 別のセレクタを試す
-            route_elem = soup.select_one("div#srline, div.searchResult")
+        # JSONデータから経路情報を取得
+        result = parse_route_from_json(soup, from_station, to_station)
 
-        if not route_elem:
-            return f"「{from_station}」→「{to_station}」の経路が見つかりませんでした。"
+        if result:
+            return result
 
-        # 時刻を取得
+        # JSONが取得できない場合はHTMLからパース
         result = parse_route_result(soup, from_station, to_station)
 
         if result:
@@ -194,9 +194,9 @@ def search_last_train(from_station, to_station):
         return "検索中にエラーが発生しました。\nしばらくしてからもう一度お試しください。"
 
 
-def parse_route_result(soup, from_station, to_station):
+def parse_route_from_json(soup, from_station, to_station):
     """
-    検索結果ページから終電情報をパースする
+    ページ内のJSONデータから経路情報を取得する
 
     Args:
         soup: BeautifulSoupオブジェクト
@@ -207,78 +207,141 @@ def parse_route_result(soup, from_station, to_station):
         str: フォーマットされた結果メッセージ
     """
     try:
-        # 出発時刻を取得
-        dep_time = None
-        arr_time = None
+        # scriptタグからJSONデータを探す
+        scripts = soup.find_all("script")
+        route_data = None
 
-        # パターン1: li.time 内の時刻
-        time_elems = soup.select("li.time")
-        if len(time_elems) >= 2:
-            dep_time = time_elems[0].get_text(strip=True)
-            arr_time = time_elems[1].get_text(strip=True)
+        for script in scripts:
+            if script.string and "featureInfoList" in script.string:
+                # naviSearchParam を探す
+                match = re.search(r'naviSearchParam\s*=\s*(\{.+?\});', script.string, re.DOTALL)
+                if match:
+                    try:
+                        route_data = json.loads(match.group(1))
+                        break
+                    except json.JSONDecodeError:
+                        continue
 
-        # パターン2: span.departure, span.arrival
+        if not route_data:
+            return None
+
+        # 最初のルート（終電に最も近い）を取得
+        feature_list = route_data.get("featureInfoList", [])
+        edge_list = route_data.get("edgeInfoList", [])
+
+        if not feature_list or not edge_list:
+            return None
+
+        # 最初のルートの情報
+        feature = feature_list[0]
+        edges = edge_list[0] if edge_list else []
+
+        # 発車・到着時刻を取得（HH:MM形式のみ）
+        dep_time = feature.get("departureTime", "")
+        arr_time = feature.get("arrivalTime", "")
+
+        # 時刻からHH:MM部分のみ抽出
+        time_match = re.search(r"(\d{1,2}:\d{2})", dep_time)
+        if time_match:
+            dep_time = time_match.group(1)
+
+        time_match = re.search(r"(\d{1,2}:\d{2})", arr_time)
+        if time_match:
+            arr_time = time_match.group(1)
+
+        # 乗換回数
+        transfer_count = feature.get("transferCount", 0)
+
+        # 路線情報と番線を取得
+        route_details = []
+        for edge in edges:
+            if isinstance(edge, dict):
+                rail_name = edge.get("railName", "")
+                # 番線情報
+                riding_info = edge.get("ridingPositionInfo", {})
+                if riding_info:
+                    dep_platform = riding_info.get("departure", "")
+                    if rail_name and dep_platform:
+                        route_details.append(f"{rail_name}（{dep_platform}）")
+                    elif rail_name:
+                        route_details.append(rail_name)
+                elif rail_name:
+                    route_details.append(rail_name)
+
+        # 結果をフォーマット
+        lines = [
+            f"🚃 {from_station} → {to_station}",
+            "",
+            f"発車 {dep_time}",
+            f"到着 {arr_time}",
+        ]
+
+        if transfer_count > 0:
+            lines.append(f"乗換 {transfer_count}回")
+
+        if route_details:
+            lines.append("")
+            for detail in route_details[:3]:  # 最大3路線
+                lines.append(f"▶ {detail}")
+
+        lines.extend([
+            "",
+            "※ 運行状況により変更の場合あり",
+        ])
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        app.logger.error(f"JSON parse error: {e}")
+        return None
+
+
+def parse_route_result(soup, from_station, to_station):
+    """
+    検索結果ページのHTMLから終電情報をパースする（フォールバック用）
+
+    Args:
+        soup: BeautifulSoupオブジェクト
+        from_station: 出発駅
+        to_station: 到着駅
+
+    Returns:
+        str: フォーマットされた結果メッセージ
+    """
+    try:
+        # 時刻のパターン（HH:MM形式）を探す
+        time_pattern = re.compile(r"(\d{1,2}:\d{2})発")
+        arr_pattern = re.compile(r"(\d{1,2}:\d{2})着")
+
+        all_text = soup.get_text()
+
+        dep_match = time_pattern.search(all_text)
+        arr_match = arr_pattern.search(all_text)
+
+        dep_time = dep_match.group(1) if dep_match else None
+        arr_time = arr_match.group(1) if arr_match else None
+
         if not dep_time:
-            dep_elem = soup.select_one("span.departure, div.departure")
-            arr_elem = soup.select_one("span.arrival, div.arrival")
-            if dep_elem:
-                dep_time = dep_elem.get_text(strip=True)
-            if arr_elem:
-                arr_time = arr_elem.get_text(strip=True)
-
-        # パターン3: より汎用的な検索
-        if not dep_time:
-            # 時刻のパターン（HH:MM形式）を探す
-            time_pattern = re.compile(r"\d{1,2}:\d{2}")
-            all_text = soup.get_text()
-            times = time_pattern.findall(all_text)
+            # 別のパターンを試す
+            times = re.findall(r"(\d{1,2}:\d{2})", all_text)
             if len(times) >= 2:
                 dep_time = times[0]
                 arr_time = times[1]
 
-        # 所要時間を取得
-        duration = None
-        duration_elem = soup.select_one("li.requredTime, span.time, div.totalTime")
-        if duration_elem:
-            duration = duration_elem.get_text(strip=True)
-
-        # 乗換回数を取得
-        transfer = None
-        transfer_elem = soup.select_one("li.transfer, span.transfer")
-        if transfer_elem:
-            transfer = transfer_elem.get_text(strip=True)
-
-        # 路線名を取得
-        line_names = []
-        line_elems = soup.select("li.transport span, div.transport, span.lineName")
-        for elem in line_elems[:3]:  # 最大3つまで
-            line_name = elem.get_text(strip=True)
-            if line_name and "円" not in line_name:
-                line_names.append(line_name)
-
         # 結果をフォーマット
         if dep_time:
             lines = [
-                f"🚃 {from_station} → {to_station} 終電",
+                f"🚃 {from_station} → {to_station}",
                 "",
-                f"🕐 発車: {dep_time}",
+                f"発車 {dep_time}",
             ]
 
             if arr_time:
-                lines.append(f"🏁 到着: {arr_time}")
-
-            if duration:
-                lines.append(f"⏱️ 所要: {duration}")
-
-            if transfer:
-                lines.append(f"🔄 乗換: {transfer}")
-
-            if line_names:
-                lines.append(f"🚈 路線: {', '.join(line_names[:2])}")
+                lines.append(f"到着 {arr_time}")
 
             lines.extend([
                 "",
-                "※ 終電情報は変更される場合があります",
+                "※ 詳細はYahoo!路線情報で確認してください",
             ])
 
             return "\n".join(lines)
