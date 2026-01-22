@@ -158,15 +158,16 @@ def search_last_train(from_station, to_station):
         delays = fetch_delay_info()
 
         # Yahoo!路線情報のURL
-        # type=1: 出発時刻指定、深夜23:50で検索して終電を取得
+        # type=1: 出発時刻指定、23:00で検索して終電に近い電車を取得
         url = (
             f"https://transit.yahoo.co.jp/search/result"
             f"?from={quote(from_station)}"
             f"&to={quote(to_station)}"
             f"&y={now.year}&m={now.month:02d}&d={now.day:02d}"
-            f"&hh=23&mm=50"
+            f"&hh=23&mm=00"
             f"&type=1"  # 出発時刻指定
             f"&ticket=ic"  # IC優先
+            f"&s=1"  # 時刻順
         )
 
         headers = {
@@ -383,49 +384,64 @@ def parse_route_from_json(soup, from_station, to_station):
     """
     try:
         # scriptタグからJSONデータを探す
-        scripts = soup.find_all("script")
         route_data = None
+        html_text = str(soup)
 
-        for script in scripts:
-            if script.string and "featureInfoList" in script.string:
-                # naviSearchParam を探す
-                match = re.search(r'naviSearchParam\s*=\s*(\{.+?\});', script.string, re.DOTALL)
-                if match:
-                    try:
+        # naviSearchParam を探す（複数のパターンを試す）
+        patterns = [
+            r'naviSearchParam\s*=\s*(\{.+?\})\s*;',
+            r'"featureInfoList"\s*:\s*(\[.+?\])\s*,\s*"edgeInfoList"',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html_text, re.DOTALL)
+            if match:
+                try:
+                    if pattern.startswith('"feature'):
+                        # 部分的なJSONの場合
+                        feature_match = re.search(r'"featureInfoList"\s*:\s*(\[.+?\])', html_text, re.DOTALL)
+                        edge_match = re.search(r'"edgeInfoList"\s*:\s*(\[.+?\]\s*\])', html_text, re.DOTALL)
+                        if feature_match and edge_match:
+                            route_data = {
+                                "featureInfoList": json.loads(feature_match.group(1)),
+                                "edgeInfoList": json.loads(edge_match.group(1))
+                            }
+                    else:
                         route_data = json.loads(match.group(1))
-                        break
-                    except json.JSONDecodeError:
-                        continue
+                    break
+                except json.JSONDecodeError:
+                    continue
 
         if not route_data:
             return None
 
-        # 最初のルート（終電に最も近い）を取得
+        # 最後のルート（最も遅い出発＝終電に近い）を取得
         feature_list = route_data.get("featureInfoList", [])
         edge_list = route_data.get("edgeInfoList", [])
 
         if not feature_list or not edge_list:
             return None
 
-        # 最初のルートの情報
-        feature = feature_list[0]
-        edges = edge_list[0] if edge_list else []
+        # 最後のルートを取得（終電に近い）
+        last_idx = len(feature_list) - 1
+        feature = feature_list[last_idx]
+        edges = edge_list[last_idx] if last_idx < len(edge_list) else edge_list[0]
 
-        # 発車・到着時刻を取得（HH:MM形式のみ）
-        dep_time = feature.get("departureTime", "")
-        arr_time = feature.get("arrivalTime", "")
+        # 発車・到着時刻を取得
+        dep_time = str(feature.get("departureTime", ""))
+        arr_time = str(feature.get("arrivalTime", ""))
 
         # 時刻からHH:MM部分のみ抽出
         time_match = re.search(r"(\d{1,2}:\d{2})", dep_time)
-        if time_match:
-            dep_time = time_match.group(1)
+        dep_time = time_match.group(1) if time_match else dep_time
 
         time_match = re.search(r"(\d{1,2}:\d{2})", arr_time)
-        if time_match:
-            arr_time = time_match.group(1)
+        arr_time = time_match.group(1) if time_match else arr_time
 
         # 乗換回数
         transfer_count = feature.get("transferCount", 0)
+        if isinstance(transfer_count, str):
+            transfer_count = int(transfer_count) if transfer_count.isdigit() else 0
 
         # 結果をフォーマット
         lines = [
@@ -441,7 +457,7 @@ def parse_route_from_json(soup, from_station, to_station):
         lines.append("")
         lines.append("━━━ 乗換案内 ━━━")
 
-        for i, edge in enumerate(edges):
+        for edge in edges:
             if not isinstance(edge, dict):
                 continue
 
@@ -449,45 +465,45 @@ def parse_route_from_json(soup, from_station, to_station):
             if not rail_name:
                 continue
 
-            # 発着駅
-            dep_station = edge.get("fromNode", {}).get("name", "") if isinstance(edge.get("fromNode"), dict) else ""
-            arr_station = edge.get("toNode", {}).get("name", "") if isinstance(edge.get("toNode"), dict) else ""
+            # 駅名
+            station_name = edge.get("stationName", "")
 
-            # 別の形式でも試す
-            if not dep_station:
-                dep_station = edge.get("departureStation", "")
-            if not arr_station:
-                arr_station = edge.get("arrivalStation", "")
+            # 時刻情報
+            time_info = edge.get("timeInfo", [])
+            edge_dep_time = ""
+            edge_arr_time = ""
 
-            # 時刻
-            edge_dep_time = edge.get("departureTime", "")
-            edge_arr_time = edge.get("arrivalTime", "")
-
-            # HH:MM形式のみ抽出
-            dep_match = re.search(r"(\d{1,2}:\d{2})", str(edge_dep_time))
-            arr_match = re.search(r"(\d{1,2}:\d{2})", str(edge_arr_time))
-            edge_dep_time = dep_match.group(1) if dep_match else ""
-            edge_arr_time = arr_match.group(1) if arr_match else ""
+            for t in time_info:
+                if isinstance(t, dict):
+                    if t.get("type") == "departure" or "発" in str(t):
+                        edge_dep_time = t.get("time", "")
+                    elif t.get("type") == "arrival" or "着" in str(t):
+                        edge_arr_time = t.get("time", "")
 
             # 番線情報
-            riding_info = edge.get("ridingPositionInfo", {})
             dep_platform = ""
+            arr_platform = ""
+            riding_info = edge.get("ridingPositionInfo", {})
             if isinstance(riding_info, dict):
-                dep_platform = riding_info.get("departure", "")
+                dep_info = riding_info.get("departure", [])
+                if isinstance(dep_info, list):
+                    dep_platform = "".join(str(x) for x in dep_info)
+                elif dep_info:
+                    dep_platform = str(dep_info)
 
-            # 路線表示
+            # 路線と駅情報を表示
             lines.append("")
             lines.append(f"▶ {rail_name}")
 
-            # 乗車駅情報
-            if dep_station and edge_dep_time:
-                platform_str = f" [{dep_platform}]" if dep_platform else ""
-                lines.append(f"  {dep_station} {edge_dep_time}発{platform_str}")
+            if station_name:
+                time_str = ""
+                if edge_dep_time:
+                    time_str = f" {edge_dep_time}発"
+                elif edge_arr_time:
+                    time_str = f" {edge_arr_time}着"
 
-            # 降車駅情報
-            if arr_station and edge_arr_time:
-                lines.append(f"  ↓")
-                lines.append(f"  {arr_station} {edge_arr_time}着")
+                platform_str = f" [{dep_platform}]" if dep_platform else ""
+                lines.append(f"  {station_name}{time_str}{platform_str}")
 
         lines.extend([
             "",
@@ -503,7 +519,7 @@ def parse_route_from_json(soup, from_station, to_station):
 
 def parse_route_result(soup, from_station, to_station):
     """
-    検索結果ページのHTMLから終電情報をパースする（フォールバック用）
+    検索結果ページのHTMLから経路情報をパースする（フォールバック用）
 
     Args:
         soup: BeautifulSoupオブジェクト
@@ -514,35 +530,47 @@ def parse_route_result(soup, from_station, to_station):
         str: フォーマットされた結果メッセージ
     """
     try:
-        # 時刻のパターン（HH:MM形式）を探す
-        time_pattern = re.compile(r"(\d{1,2}:\d{2})発")
-        arr_pattern = re.compile(r"(\d{1,2}:\d{2})着")
-
         all_text = soup.get_text()
 
-        dep_match = time_pattern.search(all_text)
-        arr_match = arr_pattern.search(all_text)
+        # 発着時刻を探す（最後のルートを取得するため全て探す）
+        dep_times = re.findall(r"(\d{1,2}:\d{2})発", all_text)
+        arr_times = re.findall(r"(\d{1,2}:\d{2})着", all_text)
 
-        dep_time = dep_match.group(1) if dep_match else None
-        arr_time = arr_match.group(1) if arr_match else None
+        # 最後のルート（終電に近い）を取得
+        dep_time = dep_times[-1] if dep_times else None
+        arr_time = arr_times[-1] if arr_times else None
 
         if not dep_time:
-            # 別のパターンを試す
             times = re.findall(r"(\d{1,2}:\d{2})", all_text)
             if len(times) >= 2:
-                dep_time = times[0]
-                arr_time = times[1]
+                # 後ろの方の時刻を使う
+                dep_time = times[-2] if len(times) > 2 else times[0]
+                arr_time = times[-1]
+
+        # 路線名を探す
+        line_names = []
+        line_matches = re.findall(r"(JR[^\s]+行|[^\s]+線[^\s]*行)", all_text)
+        if line_matches:
+            line_names = list(set(line_matches))[:3]
+
+        # 番線情報を探す
+        platform_matches = re.findall(r"(\d+番線)", all_text)
 
         # 結果をフォーマット
         if dep_time:
             lines = [
                 f"🚃 {from_station} → {to_station}",
                 "",
-                f"発車 {dep_time}",
+                f"発車 {dep_time} → 到着 {arr_time}" if arr_time else f"発車 {dep_time}",
             ]
 
-            if arr_time:
-                lines.append(f"到着 {arr_time}")
+            if line_names:
+                lines.append("")
+                lines.append("━━━ 乗換案内 ━━━")
+                for i, line_name in enumerate(line_names):
+                    platform = platform_matches[i] if i < len(platform_matches) else ""
+                    platform_str = f" [{platform}]" if platform else ""
+                    lines.append(f"▶ {line_name}{platform_str}")
 
             lines.extend([
                 "",
