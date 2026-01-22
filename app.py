@@ -427,37 +427,67 @@ def parse_route_from_json(soup, from_station, to_station):
         # 乗換回数
         transfer_count = feature.get("transferCount", 0)
 
-        # 路線情報と番線を取得
-        route_details = []
-        for edge in edges:
-            if isinstance(edge, dict):
-                rail_name = edge.get("railName", "")
-                # 番線情報
-                riding_info = edge.get("ridingPositionInfo", {})
-                if riding_info:
-                    dep_platform = riding_info.get("departure", "")
-                    if rail_name and dep_platform:
-                        route_details.append(f"{rail_name}（{dep_platform}）")
-                    elif rail_name:
-                        route_details.append(rail_name)
-                elif rail_name:
-                    route_details.append(rail_name)
-
         # 結果をフォーマット
         lines = [
             f"🚃 {from_station} → {to_station}",
             "",
-            f"発車 {dep_time}",
-            f"到着 {arr_time}",
+            f"発車 {dep_time} → 到着 {arr_time}",
         ]
 
         if transfer_count > 0:
             lines.append(f"乗換 {transfer_count}回")
 
-        if route_details:
+        # 詳細な乗り換え情報を取得
+        lines.append("")
+        lines.append("━━━ 乗換案内 ━━━")
+
+        for i, edge in enumerate(edges):
+            if not isinstance(edge, dict):
+                continue
+
+            rail_name = edge.get("railName", "")
+            if not rail_name:
+                continue
+
+            # 発着駅
+            dep_station = edge.get("fromNode", {}).get("name", "") if isinstance(edge.get("fromNode"), dict) else ""
+            arr_station = edge.get("toNode", {}).get("name", "") if isinstance(edge.get("toNode"), dict) else ""
+
+            # 別の形式でも試す
+            if not dep_station:
+                dep_station = edge.get("departureStation", "")
+            if not arr_station:
+                arr_station = edge.get("arrivalStation", "")
+
+            # 時刻
+            edge_dep_time = edge.get("departureTime", "")
+            edge_arr_time = edge.get("arrivalTime", "")
+
+            # HH:MM形式のみ抽出
+            dep_match = re.search(r"(\d{1,2}:\d{2})", str(edge_dep_time))
+            arr_match = re.search(r"(\d{1,2}:\d{2})", str(edge_arr_time))
+            edge_dep_time = dep_match.group(1) if dep_match else ""
+            edge_arr_time = arr_match.group(1) if arr_match else ""
+
+            # 番線情報
+            riding_info = edge.get("ridingPositionInfo", {})
+            dep_platform = ""
+            if isinstance(riding_info, dict):
+                dep_platform = riding_info.get("departure", "")
+
+            # 路線表示
             lines.append("")
-            for detail in route_details[:3]:  # 最大3路線
-                lines.append(f"▶ {detail}")
+            lines.append(f"▶ {rail_name}")
+
+            # 乗車駅情報
+            if dep_station and edge_dep_time:
+                platform_str = f" [{dep_platform}]" if dep_platform else ""
+                lines.append(f"  {dep_station} {edge_dep_time}発{platform_str}")
+
+            # 降車駅情報
+            if arr_station and edge_arr_time:
+                lines.append(f"  ↓")
+                lines.append(f"  {arr_station} {edge_arr_time}着")
 
         lines.extend([
             "",
