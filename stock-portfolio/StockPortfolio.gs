@@ -1,87 +1,72 @@
 /**
- * 株式ポートフォリオ管理 - Google Apps Script
+ * 株式ポートフォリオ管理 - Google Apps Script（修正版）
+ *
+ * 修正内容:
+ * - EPS/BPSは銘柄マスターで手動管理（スクレイピング不安定のため）
+ * - 目標株価を追加（アナリスト予想の代替）
+ * - 現在値はIMPORTXML関数で取得（より安定）
  *
  * 使用方法:
  * 1. このコードをGoogleスプレッドシートのスクリプトエディタにコピー
- * 2. 「銘柄マスター」シートに銘柄一覧を作成
- * 3. 「ポートフォリオ」シートでコードを入力
- *
- * データソース:
- * - 現在値: Google Finance
- * - PER/PBR/EPS/BPS: みんかぶ（グレーゾーン、負荷をかけない範囲で使用）
- * - 業種別適正PER/PBR: 設定シートで管理
+ * 2. 「株式管理」メニュー → 「初期化」を実行
+ * 3. 「銘柄マスター」シートに銘柄情報を入力
+ * 4. 「ポートフォリオ」シートでコードを入力
  */
 
 // ==================== 設定 ====================
 
 const CONFIG = {
-  // シート名
   SHEET_PORTFOLIO: 'ポートフォリオ',
   SHEET_MASTER: '銘柄マスター',
   SHEET_SETTINGS: '設定',
-
-  // キャッシュ有効期間（秒）
-  CACHE_DURATION: 3600, // 1時間
-
-  // 適正PER/PBRのデフォルト値
-  DEFAULT_TARGET_PER: 15,  // 日経平均基準
-  DEFAULT_TARGET_PBR: 1.0, // 解散価値基準
+  DEFAULT_TARGET_PER: 15,
+  DEFAULT_TARGET_PBR: 1.0,
 };
 
 // ==================== メイン関数 ====================
 
-/**
- * スプレッドシート初期化
- */
 function initializeSpreadsheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // ポートフォリオシート作成
   createPortfolioSheet(ss);
-
-  // 銘柄マスターシート作成
   createMasterSheet(ss);
-
-  // 設定シート作成
   createSettingsSheet(ss);
-
-  SpreadsheetApp.getUi().alert('初期化が完了しました。\n「銘柄マスター」シートに銘柄情報を追加してください。');
+  SpreadsheetApp.getUi().alert(
+    '初期化が完了しました。\n\n' +
+    '【次のステップ】\n' +
+    '1.「銘柄マスター」シートに保有銘柄を登録\n' +
+    '2.「ポートフォリオ」シートでコードを入力\n' +
+    '3. 数量と取得単価を入力'
+  );
 }
 
-/**
- * ポートフォリオシート作成
- */
+// ==================== ポートフォリオシート ====================
+
 function createPortfolioSheet(ss) {
   let sheet = ss.getSheetByName(CONFIG.SHEET_PORTFOLIO);
   if (!sheet) {
     sheet = ss.insertSheet(CONFIG.SHEET_PORTFOLIO);
   } else {
     sheet.clear();
+    sheet.clearConditionalFormatRules();
   }
 
-  // ヘッダー設定
+  // ヘッダー設定（ユーザー要望通りの列構成）
   const headers = [
-    'コード',      // A: 手動入力
-    '種別',        // B: 自動取得（マスターから）
-    '銘柄',        // C: 自動取得
-    '数量',        // D: 手動入力
-    '取得単価',    // E: 手動入力
-    '買い',        // F: 条件判定（理論株価 > 現在値）
-    '理論株価(PER)', // G: 計算
-    '理論株価(PBR)', // H: 計算
-    'PER予想',     // I: 手動入力（アナリスト予想）
-    'PBR予想',     // J: 手動入力（アナリスト予想）
-    '現在値',      // K: 自動取得
-    '取得額',      // L: 計算
-    '評価額',      // M: 計算
-    '損益(円)',    // N: 計算
-    '損益(%)',     // O: 計算
-    'EPS',         // P: 自動取得（補助列）
-    'BPS',         // Q: 自動取得（補助列）
-    'PER',         // R: 自動取得（補助列）
-    'PBR',         // S: 自動取得（補助列）
-    '適正PER',     // T: 設定から取得
-    '適正PBR',     // U: 設定から取得
+    'コード',           // A: 手動入力
+    '種別',             // B: 自動（マスターから）
+    '銘柄',             // C: 自動（マスターから）
+    '数量',             // D: 手動入力
+    '取得単価',         // E: 手動入力
+    '買い',             // F: 自動判定
+    '理論株価(PER)',    // G: 自動計算
+    '理論株価(PBR)',    // H: 自動計算
+    '目標株価',         // I: マスターから（アナリスト予想代替）
+    '乖離率',           // J: 目標株価との乖離率
+    '現在値',           // K: IMPORTXML
+    '取得額',           // L: 自動計算
+    '評価額',           // M: 自動計算
+    '損益(円)',         // N: 自動計算
+    '損益(%)',          // O: 自動計算
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -94,108 +79,78 @@ function createPortfolioSheet(ss) {
   headerRange.setHorizontalAlignment('center');
 
   // 列幅設定
-  sheet.setColumnWidth(1, 80);   // コード
-  sheet.setColumnWidth(2, 100);  // 種別
-  sheet.setColumnWidth(3, 150);  // 銘柄
-  sheet.setColumnWidth(4, 80);   // 数量
-  sheet.setColumnWidth(5, 100);  // 取得単価
-  sheet.setColumnWidth(6, 50);   // 買い
-  sheet.setColumnWidth(7, 120);  // 理論株価(PER)
-  sheet.setColumnWidth(8, 120);  // 理論株価(PBR)
-  sheet.setColumnWidth(9, 80);   // PER予想
-  sheet.setColumnWidth(10, 80);  // PBR予想
-  sheet.setColumnWidth(11, 100); // 現在値
-  sheet.setColumnWidth(12, 120); // 取得額
-  sheet.setColumnWidth(13, 120); // 評価額
-  sheet.setColumnWidth(14, 120); // 損益(円)
-  sheet.setColumnWidth(15, 100); // 損益(%)
+  const columnWidths = [80, 100, 150, 80, 100, 50, 110, 110, 100, 80, 100, 110, 110, 110, 90];
+  columnWidths.forEach((width, i) => sheet.setColumnWidth(i + 1, width));
 
-  // 補助列を非表示
-  sheet.hideColumns(16, 6); // P〜U列を非表示
-
-  // データ行のフォーマット設定（2行目以降、100行分）
-  const dataStartRow = 2;
-  const dataRows = 100;
-
-  // 数式を設定
-  for (let row = dataStartRow; row < dataStartRow + dataRows; row++) {
+  // データ行に数式を設定（50行分）
+  for (let row = 2; row <= 51; row++) {
     setPortfolioFormulas(sheet, row);
   }
 
-  // 条件付き書式（買いシグナル）
-  const buyRange = sheet.getRange('F2:F101');
-  const rule = SpreadsheetApp.newConditionalFormatRule()
-    .whenTextEqualTo('○')
-    .setBackground('#ffcdd2')
-    .setFontColor('#c62828')
-    .setBold(true)
-    .setRanges([buyRange])
-    .build();
-  sheet.setConditionalFormatRules([rule]);
-
-  // 損益の条件付き書式
-  const profitRange = sheet.getRange('N2:O101');
-  const profitRulePositive = SpreadsheetApp.newConditionalFormatRule()
-    .whenNumberGreaterThan(0)
-    .setFontColor('#1b5e20')
-    .setRanges([profitRange])
-    .build();
-  const profitRuleNegative = SpreadsheetApp.newConditionalFormatRule()
-    .whenNumberLessThan(0)
-    .setFontColor('#c62828')
-    .setRanges([profitRange])
-    .build();
-
-  const rules = sheet.getConditionalFormatRules();
-  rules.push(profitRulePositive);
-  rules.push(profitRuleNegative);
-  sheet.setConditionalFormatRules(rules);
+  // 条件付き書式
+  setConditionalFormatting(sheet);
 
   // 数値フォーマット
-  sheet.getRange('E2:E101').setNumberFormat('#,##0');
-  sheet.getRange('G2:H101').setNumberFormat('#,##0');
-  sheet.getRange('K2:N101').setNumberFormat('#,##0');
-  sheet.getRange('O2:O101').setNumberFormat('0.00%');
+  sheet.getRange('E2:E51').setNumberFormat('#,##0');
+  sheet.getRange('G2:I51').setNumberFormat('#,##0');
+  sheet.getRange('J2:J51').setNumberFormat('0.0%');
+  sheet.getRange('K2:N51').setNumberFormat('#,##0');
+  sheet.getRange('O2:O51').setNumberFormat('0.00%');
 
   // ウィンドウ枠の固定
   sheet.setFrozenRows(1);
 }
 
-/**
- * ポートフォリオ行に数式を設定
- */
 function setPortfolioFormulas(sheet, row) {
-  const masterSheet = CONFIG.SHEET_MASTER;
-  const settingsSheet = CONFIG.SHEET_SETTINGS;
+  const master = CONFIG.SHEET_MASTER;
+  const settings = CONFIG.SHEET_SETTINGS;
 
-  // B列: 種別（銘柄マスターからVLOOKUP）
+  // B列: 種別（銘柄マスターから）
   sheet.getRange(row, 2).setFormula(
-    `=IFERROR(VLOOKUP(A${row},'${masterSheet}'!A:C,2,FALSE),"")`
+    `=IFERROR(VLOOKUP(A${row},'${master}'!A:G,2,FALSE),"")`
   );
 
-  // C列: 銘柄名（銘柄マスターからVLOOKUP）
+  // C列: 銘柄名（銘柄マスターから）
   sheet.getRange(row, 3).setFormula(
-    `=IFERROR(VLOOKUP(A${row},'${masterSheet}'!A:C,3,FALSE),"")`
+    `=IFERROR(VLOOKUP(A${row},'${master}'!A:G,3,FALSE),"")`
   );
 
-  // F列: 買いシグナル
+  // F列: 買いシグナル（理論株価または目標株価 > 現在値）
   sheet.getRange(row, 6).setFormula(
-    `=IF(OR(A${row}="",K${row}=""),"",IF(OR(AND(G${row}<>"",G${row}>K${row}),AND(H${row}<>"",H${row}>K${row})),"○",""))`
+    `=IF(OR(A${row}="",K${row}="",K${row}=0),"",` +
+    `IF(OR(AND(G${row}<>"",G${row}>K${row}),AND(H${row}<>"",H${row}>K${row}),AND(I${row}<>"",I${row}>K${row})),"○",""))`
   );
 
   // G列: 理論株価(PER基準) = 適正PER × EPS
+  // 適正PERは設定シートから、EPSは銘柄マスターから
   sheet.getRange(row, 7).setFormula(
-    `=IFERROR(IF(OR(A${row}="",P${row}=""),"",T${row}*P${row}),"")`
+    `=IFERROR(IF(A${row}="","",` +
+    `IFERROR(VLOOKUP(B${row},'${settings}'!A:B,2,FALSE),${CONFIG.DEFAULT_TARGET_PER})` +
+    `*VLOOKUP(A${row},'${master}'!A:G,4,FALSE)),"")`
   );
 
   // H列: 理論株価(PBR基準) = 適正PBR × BPS
   sheet.getRange(row, 8).setFormula(
-    `=IFERROR(IF(OR(A${row}="",Q${row}=""),"",U${row}*Q${row}),"")`
+    `=IFERROR(IF(A${row}="","",` +
+    `IFERROR(VLOOKUP(B${row},'${settings}'!A:C,3,FALSE),${CONFIG.DEFAULT_TARGET_PBR})` +
+    `*VLOOKUP(A${row},'${master}'!A:G,5,FALSE)),"")`
   );
 
-  // K列: 現在値（カスタム関数で取得）
+  // I列: 目標株価（銘柄マスターから）
+  sheet.getRange(row, 9).setFormula(
+    `=IFERROR(VLOOKUP(A${row},'${master}'!A:G,6,FALSE),"")`
+  );
+
+  // J列: 乖離率 = (目標株価 - 現在値) / 現在値
+  sheet.getRange(row, 10).setFormula(
+    `=IFERROR(IF(OR(I${row}="",K${row}="",K${row}=0),"",(I${row}-K${row})/K${row}),"")`
+  );
+
+  // K列: 現在値（IMPORTXML使用 - Google Finance）
   sheet.getRange(row, 11).setFormula(
-    `=IF(A${row}="","",getStockPrice(A${row}))`
+    `=IF(A${row}="","",IFERROR(VALUE(SUBSTITUTE(SUBSTITUTE(` +
+    `IMPORTXML("https://www.google.com/finance/quote/"&A${row}&":TYO","//div[@class='YMlKec fxKbKc']"),` +
+    `"￥",""),",","")),"取得中..."))`
   );
 
   // L列: 取得額 = 取得単価 × 数量
@@ -205,7 +160,7 @@ function setPortfolioFormulas(sheet, row) {
 
   // M列: 評価額 = 現在値 × 数量
   sheet.getRange(row, 13).setFormula(
-    `=IF(OR(D${row}="",K${row}=""),"",D${row}*K${row})`
+    `=IF(OR(D${row}="",K${row}="",NOT(ISNUMBER(K${row}))),"",D${row}*K${row})`
   );
 
   // N列: 損益(円) = 評価額 - 取得額
@@ -215,43 +170,55 @@ function setPortfolioFormulas(sheet, row) {
 
   // O列: 損益(%) = 損益(円) / 取得額
   sheet.getRange(row, 15).setFormula(
-    `=IF(OR(L${row}="",N${row}=""),"",N${row}/L${row})`
-  );
-
-  // P列: EPS（カスタム関数）
-  sheet.getRange(row, 16).setFormula(
-    `=IF(A${row}="","",getStockEPS(A${row}))`
-  );
-
-  // Q列: BPS（カスタム関数）
-  sheet.getRange(row, 17).setFormula(
-    `=IF(A${row}="","",getStockBPS(A${row}))`
-  );
-
-  // R列: PER（カスタム関数）
-  sheet.getRange(row, 18).setFormula(
-    `=IF(A${row}="","",getStockPER(A${row}))`
-  );
-
-  // S列: PBR（カスタム関数）
-  sheet.getRange(row, 19).setFormula(
-    `=IF(A${row}="","",getStockPBR(A${row}))`
-  );
-
-  // T列: 適正PER（設定シートから種別でVLOOKUP）
-  sheet.getRange(row, 20).setFormula(
-    `=IFERROR(VLOOKUP(B${row},'${settingsSheet}'!A:B,2,FALSE),${CONFIG.DEFAULT_TARGET_PER})`
-  );
-
-  // U列: 適正PBR（設定シートから種別でVLOOKUP）
-  sheet.getRange(row, 21).setFormula(
-    `=IFERROR(VLOOKUP(B${row},'${settingsSheet}'!A:C,3,FALSE),${CONFIG.DEFAULT_TARGET_PBR})`
+    `=IF(OR(L${row}="",L${row}=0,N${row}=""),"",N${row}/L${row})`
   );
 }
 
-/**
- * 銘柄マスターシート作成
- */
+function setConditionalFormatting(sheet) {
+  const rules = [];
+
+  // 買いシグナル（○で赤背景）
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo('○')
+    .setBackground('#ffcdd2')
+    .setFontColor('#c62828')
+    .setBold(true)
+    .setRanges([sheet.getRange('F2:F51')])
+    .build());
+
+  // 損益プラス（緑）
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberGreaterThan(0)
+    .setFontColor('#1b5e20')
+    .setRanges([sheet.getRange('N2:O51')])
+    .build());
+
+  // 損益マイナス（赤）
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberLessThan(0)
+    .setFontColor('#c62828')
+    .setRanges([sheet.getRange('N2:O51')])
+    .build());
+
+  // 乖離率プラス（緑）- 割安
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberGreaterThan(0)
+    .setFontColor('#1b5e20')
+    .setRanges([sheet.getRange('J2:J51')])
+    .build());
+
+  // 乖離率マイナス（赤）- 割高
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberLessThan(0)
+    .setFontColor('#c62828')
+    .setRanges([sheet.getRange('J2:J51')])
+    .build());
+
+  sheet.setConditionalFormatRules(rules);
+}
+
+// ==================== 銘柄マスターシート ====================
+
 function createMasterSheet(ss) {
   let sheet = ss.getSheetByName(CONFIG.SHEET_MASTER);
   if (!sheet) {
@@ -260,8 +227,17 @@ function createMasterSheet(ss) {
     sheet.clear();
   }
 
-  // ヘッダー
-  const headers = ['コード', '種別', '銘柄名'];
+  // ヘッダー（EPS、BPS、目標株価を手動管理）
+  const headers = [
+    'コード',     // A
+    '種別',       // B
+    '銘柄名',     // C
+    'EPS',        // D: 手動入力（1株当たり利益）
+    'BPS',        // E: 手動入力（1株当たり純資産）
+    '目標株価',   // F: 手動入力（アナリストコンセンサス）
+    '更新日',     // G: 最終更新日
+  ];
+
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
 
   // ヘッダースタイル
@@ -269,32 +245,47 @@ function createMasterSheet(ss) {
   headerRange.setBackground('#34a853');
   headerRange.setFontColor('#ffffff');
   headerRange.setFontWeight('bold');
+  headerRange.setHorizontalAlignment('center');
 
-  // サンプルデータ
+  // サンプルデータ（実際の数値は確認して更新してください）
   const sampleData = [
-    ['7203', '自動車', 'トヨタ自動車'],
-    ['9984', '通信', 'ソフトバンクグループ'],
-    ['6758', '電気機器', 'ソニーグループ'],
-    ['8306', '銀行', '三菱UFJフィナンシャル・グループ'],
-    ['9432', '通信', '日本電信電話'],
-    ['6861', '電気機器', 'キーエンス'],
-    ['4063', '化学', '信越化学工業'],
-    ['6501', '電気機器', '日立製作所'],
-    ['7974', 'その他製品', '任天堂'],
-    ['8035', '電気機器', '東京エレクトロン'],
+    ['7203', '自動車', 'トヨタ自動車', 285, 3200, 3500, '2026/01/26'],
+    ['9984', '通信', 'ソフトバンクグループ', 450, 5800, 12000, '2026/01/26'],
+    ['6758', '電気機器', 'ソニーグループ', 700, 6500, 18000, '2026/01/26'],
+    ['8306', '銀行', '三菱UFJフィナンシャル', 150, 1800, 2000, '2026/01/26'],
+    ['9432', '通信', '日本電信電話', 350, 2800, 5000, '2026/01/26'],
+    ['6861', '電気機器', 'キーエンス', 2500, 15000, 75000, '2026/01/26'],
+    ['4063', '化学', '信越化学工業', 750, 7500, 7000, '2026/01/26'],
+    ['6501', '電気機器', '日立製作所', 600, 5500, 15000, '2026/01/26'],
+    ['7974', 'その他製品', '任天堂', 400, 6800, 10000, '2026/01/26'],
+    ['8035', '電気機器', '東京エレクトロン', 2000, 12000, 28000, '2026/01/26'],
   ];
 
-  sheet.getRange(2, 1, sampleData.length, 3).setValues(sampleData);
+  if (sampleData.length > 0) {
+    sheet.getRange(2, 1, sampleData.length, 7).setValues(sampleData);
+  }
 
   // 列幅
   sheet.setColumnWidth(1, 80);
-  sheet.setColumnWidth(2, 120);
-  sheet.setColumnWidth(3, 250);
+  sheet.setColumnWidth(2, 100);
+  sheet.setColumnWidth(3, 200);
+  sheet.setColumnWidth(4, 80);
+  sheet.setColumnWidth(5, 80);
+  sheet.setColumnWidth(6, 100);
+  sheet.setColumnWidth(7, 100);
+
+  // 数値フォーマット
+  sheet.getRange('D2:F100').setNumberFormat('#,##0');
+
+  // 入力ガイド
+  sheet.getRange('A1').setNote('4桁の証券コード');
+  sheet.getRange('D1').setNote('EPS: 1株当たり利益\n会社四季報やみんかぶで確認');
+  sheet.getRange('E1').setNote('BPS: 1株当たり純資産\n会社四季報やみんかぶで確認');
+  sheet.getRange('F1').setNote('目標株価: アナリストコンセンサス\nみんかぶ・Yahoo!ファイナンスで確認');
 }
 
-/**
- * 設定シート作成
- */
+// ==================== 設定シート ====================
+
 function createSettingsSheet(ss) {
   let sheet = ss.getSheetByName(CONFIG.SHEET_SETTINGS);
   if (!sheet) {
@@ -303,253 +294,55 @@ function createSettingsSheet(ss) {
     sheet.clear();
   }
 
-  // ヘッダー
   const headers = ['種別', '適正PER', '適正PBR', '備考'];
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
 
-  // ヘッダースタイル
   const headerRange = sheet.getRange(1, 1, 1, headers.length);
   headerRange.setBackground('#fbbc04');
   headerRange.setFontColor('#000000');
   headerRange.setFontWeight('bold');
 
-  // 業種別適正PER/PBRサンプル
+  // 業種別適正PER/PBR
   const settingsData = [
-    ['自動車', 10, 0.8, '製造業は低めのPER'],
-    ['通信', 12, 1.2, '安定成長株'],
-    ['電気機器', 18, 2.0, '成長期待が高い'],
-    ['銀行', 8, 0.5, '金融業は低PBR'],
+    ['自動車', 10, 0.8, '景気敏感・低PER'],
+    ['通信', 12, 1.2, '安定配当'],
+    ['電気機器', 18, 2.0, '成長期待'],
+    ['銀行', 8, 0.5, '低PBR傾向'],
     ['化学', 12, 1.0, ''],
     ['その他製品', 15, 1.5, ''],
     ['医薬品', 20, 2.5, '高成長期待'],
     ['小売', 15, 1.5, ''],
     ['建設', 10, 0.8, ''],
     ['不動産', 12, 1.0, ''],
+    ['食品', 18, 1.8, 'ディフェンシブ'],
+    ['サービス', 20, 2.0, ''],
   ];
 
   sheet.getRange(2, 1, settingsData.length, 4).setValues(settingsData);
 
-  // 列幅
   sheet.setColumnWidth(1, 120);
   sheet.setColumnWidth(2, 80);
   sheet.setColumnWidth(3, 80);
   sheet.setColumnWidth(4, 200);
+
+  // 説明追加
+  sheet.getRange('A1').setNote('銘柄マスターの「種別」と一致させる');
+  sheet.getRange('B1').setNote('理論株価(PER) = 適正PER × EPS');
+  sheet.getRange('C1').setNote('理論株価(PBR) = 適正PBR × BPS');
 }
 
-// ==================== 株価データ取得関数 ====================
+// ==================== メニュー ====================
 
-/**
- * 株価取得（Google Finance経由）
- * @param {string} code 証券コード
- * @return {number} 現在株価
- * @customfunction
- */
-function getStockPrice(code) {
-  if (!code) return '';
-
-  const cache = CacheService.getScriptCache();
-  const cacheKey = `price_${code}`;
-  const cached = cache.get(cacheKey);
-
-  if (cached) {
-    return parseFloat(cached);
-  }
-
-  try {
-    // Google Finance から取得
-    const url = `https://www.google.com/finance/quote/${code}:TYO?hl=ja`;
-    const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
-    const html = response.getContentText();
-
-    // 株価を抽出（YMlKec fxKbKc クラスを持つ要素）
-    const priceMatch = html.match(/class="YMlKec fxKbKc"[^>]*>([^<]+)</);
-    if (priceMatch) {
-      let price = priceMatch[1]
-        .replace(/[￥¥,\s]/g, '')
-        .replace(/,/g, '');
-      price = parseFloat(price);
-
-      if (!isNaN(price)) {
-        cache.put(cacheKey, price.toString(), CONFIG.CACHE_DURATION);
-        return price;
-      }
-    }
-
-    return 'N/A';
-  } catch (e) {
-    console.error(`株価取得エラー (${code}): ${e.message}`);
-    return 'Error';
-  }
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('株式管理')
+    .addItem('初期化（シート作成）', 'initializeSpreadsheet')
+    .addSeparator()
+    .addItem('サマリー表示', 'showPortfolioSummary')
+    .addItem('使い方ガイド', 'showGuide')
+    .addToUi();
 }
 
-/**
- * EPS取得（みんかぶから）
- * @param {string} code 証券コード
- * @return {number} EPS（1株当たり利益）
- * @customfunction
- */
-function getStockEPS(code) {
-  if (!code) return '';
-
-  const data = getMinkabuData(code);
-  return data.eps || '';
-}
-
-/**
- * BPS取得（みんかぶから）
- * @param {string} code 証券コード
- * @return {number} BPS（1株当たり純資産）
- * @customfunction
- */
-function getStockBPS(code) {
-  if (!code) return '';
-
-  const data = getMinkabuData(code);
-  return data.bps || '';
-}
-
-/**
- * PER取得
- * @param {string} code 証券コード
- * @return {number} PER
- * @customfunction
- */
-function getStockPER(code) {
-  if (!code) return '';
-
-  const data = getMinkabuData(code);
-  return data.per || '';
-}
-
-/**
- * PBR取得
- * @param {string} code 証券コード
- * @return {number} PBR
- * @customfunction
- */
-function getStockPBR(code) {
-  if (!code) return '';
-
-  const data = getMinkabuData(code);
-  return data.pbr || '';
-}
-
-/**
- * みんかぶからデータを一括取得（キャッシュ付き）
- * @param {string} code 証券コード
- * @return {object} {eps, bps, per, pbr}
- */
-function getMinkabuData(code) {
-  const cache = CacheService.getScriptCache();
-  const cacheKey = `minkabu_${code}`;
-  const cached = cache.get(cacheKey);
-
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  const data = {
-    eps: null,
-    bps: null,
-    per: null,
-    pbr: null
-  };
-
-  try {
-    const url = `https://minkabu.jp/stock/${code}`;
-    const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
-    const html = response.getContentText();
-
-    // PER抽出
-    const perMatch = html.match(/PER[（(]調整後[)）]<\/th>\s*<td[^>]*>([0-9,.]+)/);
-    if (perMatch) {
-      data.per = parseFloat(perMatch[1].replace(/,/g, ''));
-    } else {
-      // 代替パターン
-      const perMatch2 = html.match(/PER<\/th>\s*<td[^>]*>([0-9,.]+)/);
-      if (perMatch2) {
-        data.per = parseFloat(perMatch2[1].replace(/,/g, ''));
-      }
-    }
-
-    // PBR抽出
-    const pbrMatch = html.match(/PBR[（(]実績[)）]<\/th>\s*<td[^>]*>([0-9,.]+)/);
-    if (pbrMatch) {
-      data.pbr = parseFloat(pbrMatch[1].replace(/,/g, ''));
-    } else {
-      const pbrMatch2 = html.match(/PBR<\/th>\s*<td[^>]*>([0-9,.]+)/);
-      if (pbrMatch2) {
-        data.pbr = parseFloat(pbrMatch2[1].replace(/,/g, ''));
-      }
-    }
-
-    // EPS抽出（1株益）
-    const epsMatch = html.match(/1株益[（(]円[)）]<\/th>\s*<td[^>]*>([0-9,.]+)/);
-    if (epsMatch) {
-      data.eps = parseFloat(epsMatch[1].replace(/,/g, ''));
-    } else {
-      const epsMatch2 = html.match(/EPS<\/th>\s*<td[^>]*>([0-9,.]+)/);
-      if (epsMatch2) {
-        data.eps = parseFloat(epsMatch2[1].replace(/,/g, ''));
-      }
-    }
-
-    // BPS抽出（1株純資産）
-    const bpsMatch = html.match(/1株純資産[（(]円[)）]<\/th>\s*<td[^>]*>([0-9,.]+)/);
-    if (bpsMatch) {
-      data.bps = parseFloat(bpsMatch[1].replace(/,/g, ''));
-    } else {
-      const bpsMatch2 = html.match(/BPS<\/th>\s*<td[^>]*>([0-9,.]+)/);
-      if (bpsMatch2) {
-        data.bps = parseFloat(bpsMatch2[1].replace(/,/g, ''));
-      }
-    }
-
-    // キャッシュに保存
-    cache.put(cacheKey, JSON.stringify(data), CONFIG.CACHE_DURATION);
-
-  } catch (e) {
-    console.error(`みんかぶデータ取得エラー (${code}): ${e.message}`);
-  }
-
-  return data;
-}
-
-// ==================== 一括更新機能 ====================
-
-/**
- * 全銘柄のデータを一括更新
- */
-function refreshAllData() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(CONFIG.SHEET_PORTFOLIO);
-
-  if (!sheet) {
-    SpreadsheetApp.getUi().alert('ポートフォリオシートが見つかりません。');
-    return;
-  }
-
-  // キャッシュをクリア
-  const cache = CacheService.getScriptCache();
-
-  // コード列を取得
-  const codes = sheet.getRange('A2:A101').getValues().flat().filter(c => c);
-
-  // 各コードのキャッシュを削除
-  codes.forEach(code => {
-    cache.remove(`price_${code}`);
-    cache.remove(`minkabu_${code}`);
-  });
-
-  // シートを再計算
-  SpreadsheetApp.flush();
-
-  SpreadsheetApp.getUi().alert(`${codes.length}銘柄のデータを更新しました。`);
-}
-
-/**
- * サマリーを表示
- */
 function showPortfolioSummary() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(CONFIG.SHEET_PORTFOLIO);
@@ -561,107 +354,53 @@ function showPortfolioSummary() {
 
   const data = sheet.getDataRange().getValues();
 
-  let totalCost = 0;      // 総取得額
-  let totalValue = 0;     // 総評価額
-  let stockCount = 0;     // 銘柄数
-  let buySignalCount = 0; // 買いシグナル数
+  let totalCost = 0;
+  let totalValue = 0;
+  let stockCount = 0;
+  let buySignalCount = 0;
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    if (row[0]) { // コードがある行
+    if (row[0]) {
       stockCount++;
-
-      const cost = parseFloat(row[11]) || 0;     // L列: 取得額
-      const value = parseFloat(row[12]) || 0;    // M列: 評価額
-      const buySignal = row[5];                   // F列: 買いシグナル
-
+      const cost = parseFloat(row[11]) || 0;
+      const value = parseFloat(row[12]) || 0;
       totalCost += cost;
       totalValue += value;
-
-      if (buySignal === '○') {
-        buySignalCount++;
-      }
+      if (row[5] === '○') buySignalCount++;
     }
   }
 
   const totalProfit = totalValue - totalCost;
   const profitRate = totalCost > 0 ? (totalProfit / totalCost * 100).toFixed(2) : 0;
 
-  const message = `
-【ポートフォリオサマリー】
-
-保有銘柄数: ${stockCount}銘柄
-買いシグナル: ${buySignalCount}銘柄
-
-総取得額: ¥${totalCost.toLocaleString()}
-総評価額: ¥${totalValue.toLocaleString()}
-総損益: ¥${totalProfit.toLocaleString()} (${profitRate}%)
-  `;
-
-  SpreadsheetApp.getUi().alert(message);
+  SpreadsheetApp.getUi().alert(
+    `【ポートフォリオサマリー】\n\n` +
+    `保有銘柄数: ${stockCount}銘柄\n` +
+    `買いシグナル: ${buySignalCount}銘柄\n\n` +
+    `総取得額: ¥${totalCost.toLocaleString()}\n` +
+    `総評価額: ¥${totalValue.toLocaleString()}\n` +
+    `総損益: ¥${totalProfit.toLocaleString()} (${profitRate}%)`
+  );
 }
 
-// ==================== メニュー ====================
-
-/**
- * メニューを追加
- */
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('株式管理')
-    .addItem('初期化（シート作成）', 'initializeSpreadsheet')
-    .addSeparator()
-    .addItem('全データ更新', 'refreshAllData')
-    .addItem('サマリー表示', 'showPortfolioSummary')
-    .addToUi();
-}
-
-// ==================== IMPORTXML代替（シンプル版） ====================
-
-/**
- * IMPORTXML関数の代替（Google Finance用）
- * スプレッドシートの数式として使用: =STOCK_PRICE("7203")
- *
- * @param {string} code 証券コード
- * @return {number} 株価
- * @customfunction
- */
-function STOCK_PRICE(code) {
-  return getStockPrice(code);
-}
-
-/**
- * @param {string} code 証券コード
- * @return {number} EPS
- * @customfunction
- */
-function STOCK_EPS(code) {
-  return getStockEPS(code);
-}
-
-/**
- * @param {string} code 証券コード
- * @return {number} BPS
- * @customfunction
- */
-function STOCK_BPS(code) {
-  return getStockBPS(code);
-}
-
-/**
- * @param {string} code 証券コード
- * @return {number} PER
- * @customfunction
- */
-function STOCK_PER(code) {
-  return getStockPER(code);
-}
-
-/**
- * @param {string} code 証券コード
- * @return {number} PBR
- * @customfunction
- */
-function STOCK_PBR(code) {
-  return getStockPBR(code);
+function showGuide() {
+  SpreadsheetApp.getUi().alert(
+    `【使い方ガイド】\n\n` +
+    `1. 銘柄マスターに保有銘柄を登録\n` +
+    `   - コード: 4桁の証券コード\n` +
+    `   - 種別: 業種（設定シートと一致させる）\n` +
+    `   - EPS/BPS: 会社四季報やみんかぶで確認\n` +
+    `   - 目標株価: アナリストコンセンサス\n\n` +
+    `2. ポートフォリオでコードを入力\n` +
+    `   - 数量と取得単価を入力\n` +
+    `   - 現在値は自動取得されます\n\n` +
+    `3. 「買い」シグナル\n` +
+    `   - 理論株価または目標株価が\n` +
+    `     現在値より高い場合に「○」表示\n\n` +
+    `【EPS/BPS確認先】\n` +
+    `・みんかぶ: minkabu.jp\n` +
+    `・Yahoo!ファイナンス\n` +
+    `・会社四季報オンライン`
+  );
 }
